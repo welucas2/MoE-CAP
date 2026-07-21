@@ -62,6 +62,10 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     prompt_len: int = 0
+    # Set when generated_text had to fall back to the reasoning-channel text
+    # because the model never emitted a final-channel answer (see
+    # async_request_openai_chat_completions for why this happens).
+    used_reasoning_fallback: bool = False
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -208,6 +212,19 @@ async def async_request_openai_chat_completions(
                     # Handle both regular and reasoning model responses
                     msg = choice.get("message", {})
                     generated_text = msg.get("content") or ""
+                    if not generated_text:
+                        # Reasoning models (e.g. gpt-oss via --reasoning-parser)
+                        # split output into a reasoning channel ("reasoning_content")
+                        # and a final-answer channel ("content"). If generation is
+                        # cut off (hits max_completion_tokens, or ignore_eos forces
+                        # decoding past the model's own stop) before the model
+                        # reaches the final channel, "content" comes back empty
+                        # even though real text was generated. Fall back to the
+                        # reasoning text so scoring isn't silently done against "".
+                        reasoning_text = msg.get("reasoning_content") or ""
+                        if reasoning_text:
+                            generated_text = reasoning_text
+                            output.used_reasoning_fallback = True
                     latency = time.perf_counter() - st
                     output.generated_text = generated_text
                     output.success = True
@@ -868,6 +885,19 @@ class OpenAIAPIMoEProfiler:
                 prompt_lengths=prompt_lengths,
             )
 
+            fallback_count = sum(
+                1 for r in results if getattr(r, "used_reasoning_fallback", False)
+            )
+            if fallback_count:
+                print(
+                    f"Warning: {fallback_count}/{len(results)} requests never reached "
+                    "the final-answer channel before hitting the output token budget "
+                    "(or ignore_eos forced decoding past the model's own stop); "
+                    "scored using raw reasoning-channel text instead. Consider "
+                    "raising --max-completion-tokens or disabling ignore_eos for "
+                    "accuracy runs on reasoning models."
+                )
+
             # Stop recording and retrieve server-side forward records.
             self._stop_batch_recording()
             server_records = self._dump_batch_recording()
@@ -1153,6 +1183,9 @@ class OpenAIAPIMoEProfiler:
                         # -> old runs' per-request latency is unrecoverable).
                         "latency_s": getattr(result, "latency", 0) or 0,
                         "ttft_s": getattr(result, "ttft", 0) or 0,
+                        "used_reasoning_fallback": getattr(
+                            result, "used_reasoning_fallback", False
+                        ),
                     }
                     if result.error:
                         record["error"] = result.error[:500]
