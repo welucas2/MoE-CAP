@@ -278,11 +278,11 @@ def _to_cpu_list(value):
     return list(value)
 
 
-_prefill_req_counter = 0
 
+_prefill_generation_by_pool_idx: Dict[int, int] = {}
+_prefill_true_prompt_len_by_pool_idx: Dict[int, int] = {}
 
 def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: ServerArgs):
-    global _prefill_req_counter
     req_indices = _to_cpu_list(forward_batch.req_pool_indices) or []
 
     extend_lens = _to_cpu_list(forward_batch.extend_seq_lens_cpu)
@@ -293,27 +293,39 @@ def _build_prefill_per_req_info(forward_batch: ForwardBatch, server_args: Server
     if total_lens is None:
         total_lens = _to_cpu_list(forward_batch.seq_lens) or []
 
-    chunk_size = getattr(server_args, "chunked_prefill_size", None)
-    chunk_size_int = int(chunk_size) if chunk_size is not None else None
-    chunking_enabled = chunk_size_int is not None and chunk_size_int > 0
+    reqs = getattr(forward_batch, "reqs", None) or []
 
     per_req_info = []
-    for req_idx, extend_len, total_len in zip(req_indices, extend_lens, total_lens):
-        is_last_chunk = True
-        if chunking_enabled:
-            assert chunk_size_int is not None
-            is_last_chunk = int(extend_len) < chunk_size_int
+    for i, (req_idx, extend_len, total_len) in enumerate(
+        zip(req_indices, extend_lens, total_lens)
+    ):
+        req_idx_int = int(req_idx)
+
+        true_prompt_len = _prefill_true_prompt_len_by_pool_idx.get(req_idx_int)
+        if true_prompt_len is None and i < len(reqs):
+            origin_ids = getattr(reqs[i], "origin_input_ids", None)
+            if origin_ids is not None:
+                true_prompt_len = len(origin_ids)
+                _prefill_true_prompt_len_by_pool_idx[req_idx_int] = true_prompt_len
+
+        if true_prompt_len is not None:
+            is_last_chunk = int(total_len) >= true_prompt_len
+        else:
+            is_last_chunk = False
+
+        gen = _prefill_generation_by_pool_idx.get(req_idx_int, 0)
         per_req_info.append(
             {
-                "req_pool_idx": int(req_idx),
-                "req_id": f"{int(req_idx)}_{_prefill_req_counter}",
+                "req_pool_idx": req_idx_int,
+                "req_id": f"{req_idx_int}_{gen}",
                 "extend_len": int(extend_len),
                 "total_len": int(total_len),
                 "is_last_chunk": is_last_chunk,
             }
         )
         if is_last_chunk:
-            _prefill_req_counter += 1
+            _prefill_generation_by_pool_idx[req_idx_int] = gen + 1
+            _prefill_true_prompt_len_by_pool_idx.pop(req_idx_int, None)
 
     return per_req_info
 
